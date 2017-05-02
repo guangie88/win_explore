@@ -1,11 +1,9 @@
 #[macro_use]
 extern crate error_chain;
-extern crate libc;
 
 #[macro_use]
 extern crate log;
 extern crate log4rs;
-extern crate serde_json;
 extern crate structopt;
 
 #[macro_use]
@@ -14,7 +12,7 @@ extern crate winapi;
 
 use std::io::{self, Read, Write};
 use std::process;
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use structopt::StructOpt;
 
 mod errors {
@@ -49,42 +47,52 @@ fn run() -> Result<()> {
     info!("Config: {:?}", config);
 
     // body content
-    let addr_port_array = [(config.address.as_str(), config.port)];
+    let addr = config.address.as_str();
+    let port = config.port;
 
-    let tcp_cycle = addr_port_array.into_iter().cycle()
-        .map(|&(addr, port)| -> Result<String> {
-            let mut stream = TcpStream::connect((addr, port))
-                .chain_err(|| format!("Unable to connect TCP stream at '{}:{}'", addr, port))?;
+    let stream_loop_fn = || -> Result<_> {
+        let mut stream = TcpStream::connect((addr, port))
+            .chain_err(|| format!("Unable to connect TCP stream at '{}:{}'", addr, port))?;
 
-            // send directory path to server
-            print!("Enter directory to explore: ");
-            let mut dir_path = String::new();
+        // send directory path to server
+        println!("Enter directory to explore:");
+        let mut dir_path = String::new();
 
-            io::stdin().read_to_string(&mut dir_path)
-                .chain_err(|| "Unable to read string from stdin")?;
-            
-            let dir_path = dir_path;
+        io::stdin().read_line(&mut dir_path)
+            .chain_err(|| "Unable to read string from stdin")?;
 
-            stream.write_fmt(format_args!("{}", dir_path))
-                .chain_err(|| "Unable to write buffer string into stream")?;
-            
-            // receive status from server
-            let mut status = String::new();
+        let dir_path = dir_path.trim();
+        debug!("Entered directory path: '{}'", dir_path);
 
-            stream.read_to_string(&mut status)
-                .chain_err(|| "Unable to read status from server stream")?;
+        write!(stream, "{}", dir_path)
+            .chain_err(|| "Unable to write buffer string into stream")?;
 
-            let status = status;
+        stream.flush()
+            .chain_err(|| "Unable to flush the stream")?;
 
-            if status != "OK" {
-                bail!(format!("{}", status));
-            }
+        stream.shutdown(Shutdown::Write)
+            .chain_err(|| "Error shutting down write side of stream")?;
+        
+        // receive status from server
+        let mut status = String::new();
 
-            Ok(dir_path)
-        });
+        stream.read_to_string(&mut status)
+            .chain_err(|| "Unable to read status from server stream")?;
 
-    for status_res in tcp_cycle {
-        match status_res {
+        stream.shutdown(Shutdown::Read)
+            .chain_err(|| "Error shutting down read side of stream")?;
+
+        let status = status;
+
+        if status != "OK" {
+            bail!(format!("{}", status));
+        }
+
+        Ok(dir_path.to_owned())
+    };
+
+    loop {
+        match stream_loop_fn() {
             Ok(dir_path) => {
                 info!("'{}' okay to explore!", dir_path);
             },
@@ -94,8 +102,6 @@ fn run() -> Result<()> {
             },
         }
     }
-
-    Ok(())
 }
 
 fn main() {

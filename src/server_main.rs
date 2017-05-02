@@ -1,11 +1,9 @@
 #[macro_use]
 extern crate error_chain;
-extern crate libc;
 
 #[macro_use]
 extern crate log;
 extern crate log4rs;
-extern crate serde_json;
 extern crate structopt;
 
 #[macro_use]
@@ -17,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::ptr;
 use std::process;
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use structopt::StructOpt;
 use winapi::basetsd::INT_PTR;
 use winapi::minwindef::{HINSTANCE, INT};
@@ -73,55 +71,82 @@ fn run() -> Result<()> {
         .chain_err(|| format!("Unable to bind TCP listener at '{}:{}'", config.address, config.port))?;
 
     let tcp_cycle = listener.incoming()
-        .map(|stream| -> Result<String> {
+        .map(|stream| -> Result<_> {
+            debug!("Checking incoming stream...");
             let mut stream = stream.chain_err(|| "Unable to get a valid stream")?;
+            debug!("Checked valid incoming stream!");
 
-            let mut dir_path = String::new();
+            let server_loop_fn = |stream: &mut TcpStream| -> Result<_> {
+                let mut dir_path = String::new();
 
-            stream.read_to_string(&mut dir_path)
-                .chain_err(|| "Unable to read string from TCP stream")?;
+                stream.read_to_string(&mut dir_path)
+                    .chain_err(|| "Unable to read string from TCP stream")?;
 
-            let dir_path = dir_path;
+                stream.shutdown(Shutdown::Read)
+                    .chain_err(|| "Error shutting down read side of stream")?;
 
-            // scope here because need to return directory path at the end
-            {
-                // check for valid directory first
-                let dir_path_fs = Path::new(&dir_path);
+                let dir_path = dir_path;
 
-                if dir_path_fs.is_dir() {
-                    bail!(format!("Given path is not a directory: {:?}", dir_path));
+                if dir_path.is_empty() {
+                    bail!("Given path is an empty string");
                 }
 
-                let dir_path_ref: &[u8] = dir_path.as_ref();
-                let dir_path_vec: Vec<u8> = dir_path_ref.into();
-                let c_dir_path = CString::new(dir_path_vec).unwrap();
+                // scope here because need to return directory path at the end
+                let shell_ret_code = {
+                    // check for valid directory first
+                    let dir_path_fs = Path::new(&dir_path);
 
-                // the return value must be interpreted as INT_PTR
-                // success if the return code is > 32
-                // otherwise failure code needs to be referred on Windows API
-                let shell_ret_code = unsafe {
-                    ShellExecuteA(
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        c_dir_path.as_ptr() as *const i8,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        SW_SHOW) as INT_PTR
+                    if !dir_path_fs.is_dir() {
+                        bail!(format!("Given path is not a directory: {:?}", dir_path));
+                    }
+
+                    let dir_path_ref: &[u8] = dir_path.as_ref();
+                    let dir_path_vec: Vec<u8> = dir_path_ref.into();
+                    let c_dir_path = CString::new(dir_path_vec)
+                        .chain_err(|| format!("Unable to convert {} into CString", dir_path))?;
+
+                    // the return value must be interpreted as INT_PTR
+                    // success if the return code is > 32
+                    // otherwise failure code needs to be referred on Windows API
+                    unsafe {
+                        ShellExecuteA(
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            c_dir_path.as_ptr() as *const i8,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            SW_SHOW) as INT_PTR
+                    }
                 };
 
                 const CRITERION: INT_PTR = 32 as INT_PTR;
 
                 let status = if shell_ret_code > CRITERION {
-                    "OK".to_string()
+                    "OK".to_owned()
                 } else {
                     format!("Error shell executing the given directory '{}', error code: {:?}", dir_path, shell_ret_code)
                 };
 
-                stream.write_fmt(format_args!("{}", status))
-                    .chain_err(|| "Unable to write buffer string into stream")?;
-            }
+                Ok((dir_path, status))
+            };
 
-            Ok(dir_path)
+            let status_res = server_loop_fn(&mut stream);
+
+            let status = match status_res {
+                Ok((_, ref status)) => format!("{}", status),
+                Err(ref e) => format!("{}", e),
+            };
+
+            write!(stream, "{}", status)
+                .chain_err(|| "Unable to write buffer string into stream")?;
+
+            stream.flush()
+                .chain_err(|| "Unable to flush the stream")?;
+
+            stream.shutdown(Shutdown::Write)
+                .chain_err(|| "Error shutting down write side of stream")?;
+
+            status_res.map(|(dir_path, _)| dir_path)
         });
 
     for status_res in tcp_cycle {
