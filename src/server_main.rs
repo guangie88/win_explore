@@ -108,6 +108,9 @@ fn run() -> Result<()> {
                     // the return value must be interpreted as INT_PTR
                     // success if the return code is > 32
                     // otherwise failure code needs to be referred on Windows API
+
+                    debug!("Attempting to perform shell execute on '{}'...", dir_path);
+
                     unsafe {
                         ShellExecuteA(
                             ptr::null_mut(),
@@ -121,19 +124,17 @@ fn run() -> Result<()> {
 
                 const CRITERION: INT_PTR = 32 as INT_PTR;
 
-                let status = if shell_ret_code > CRITERION {
-                    "OK".to_owned()
+                if shell_ret_code > CRITERION {
+                    Ok(dir_path)
                 } else {
-                    format!("Error shell executing the given directory '{}', error code: {:?}", dir_path, shell_ret_code)
-                };
-
-                Ok((dir_path, status))
+                    bail!(format!("Error shell executing the given directory '{}', error code: {:?}", dir_path, shell_ret_code));
+                }
             };
 
             let status_res = server_loop_fn(&mut stream);
 
             let status = match status_res {
-                Ok((_, ref status)) => format!("{}", status),
+                Ok(_) => "OK".to_owned(),
                 Err(ref e) => format!("{}", e),
             };
 
@@ -146,7 +147,7 @@ fn run() -> Result<()> {
             stream.shutdown(Shutdown::Write)
                 .chain_err(|| "Error shutting down write side of stream")?;
 
-            status_res.map(|(dir_path, _)| dir_path)
+            status_res
         });
 
     for status_res in tcp_cycle {
